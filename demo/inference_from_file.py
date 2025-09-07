@@ -1,12 +1,11 @@
 import argparse
 import os
 import re
-import sys
 import traceback
 from typing import List, Tuple, Union, Dict, Any
 import time
-import difflib
 import torch
+import difflib
 
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -17,61 +16,58 @@ logger = logging.get_logger(__name__)
 
 
 class VoiceMapper:
-    """Maps speaker names to voice file paths"""
+    """Maps speaker names to voice file paths and provides utilities to inspect availability."""
 
     def __init__(self):
         self.setup_voice_presets()
 
-        # change name according to our preset wav file
+        # Create normalized aliases from filenames to improve matching.
+        # Example: "Ava_West" -> alias "Ava"; "John-Doe" -> alias "Doe"
         new_dict = {}
         for name, path in self.voice_presets.items():
-            if "_" in name:
-                name = name.split("_")[0]
+            alias = name
+            if "_" in alias:
+                alias = alias.split("_")[0]
+                new_dict[alias] = path
+            # add a second alias using the tail after '-' if present
+            alias2 = name
+            if "-" in alias2:
+                alias2 = alias2.split("-")[-1]
+                new_dict[alias2] = path
 
-            if "-" in name:
-                name = name.split("-")[-1]
-
-            new_dict[name] = path
+        # Merge aliases into the presets (later keys may override earlier ones; that's OK)
         self.voice_presets.update(new_dict)
-        # print(list(self.voice_presets.keys()))
 
     def setup_voice_presets(self):
-        """Setup voice presets by scanning the voices directory."""
+        """Setup voice presets by scanning the voices directory for .wav files."""
         voices_dir = os.path.join(os.path.dirname(__file__), "voices")
 
-        # Check if voices directory exists
         if not os.path.exists(voices_dir):
             print(f"Warning: Voices directory not found at {voices_dir}")
-            self.voice_presets = {}
-            self.available_voices = {}
+            self.voice_presets: Dict[str, str] = {}
+            self.available_voices: Dict[str, str] = {}
             return
 
         # Scan for all WAV files in the voices directory
         self.voice_presets = {}
 
-        # Get all .wav files in the voices directory
         wav_files = [
             f
             for f in os.listdir(voices_dir)
             if f.lower().endswith(".wav") and os.path.isfile(os.path.join(voices_dir, f))
         ]
 
-        # Create dictionary with filename (without extension) as key
         for wav_file in wav_files:
-            # Remove .wav extension to get the name
             name = os.path.splitext(wav_file)[0]
-            # Create full path
             full_path = os.path.join(voices_dir, wav_file)
             self.voice_presets[name] = full_path
 
-        # Sort the voice presets alphabetically by name for better UI
+        # Sort alphabetically for a nicer listing
         self.voice_presets = dict(sorted(self.voice_presets.items()))
 
-        # Filter out voices that don't exist (this is now redundant but kept for safety)
+        # Filter out voices that don't exist (redundant, but safe)
         self.available_voices = {
-            name: path
-            for name, path in self.voice_presets.items()
-            if os.path.exists(path)
+            name: path for name, path in self.voice_presets.items() if os.path.exists(path)
         }
 
         print(f"Found {len(self.available_voices)} voice files in {voices_dir}")
@@ -79,65 +75,60 @@ class VoiceMapper:
             print(f"Available voices: {', '.join(self.available_voices.keys())}")
 
     def list_speakers(self) -> List[str]:
-        """All recognizable speaker names (including normalized aliases created in __init__)."""
+        """Return all recognizable speaker names (including normalized aliases)."""
         return sorted(self.voice_presets.keys())
 
     def best_match(self, speaker_name: str) -> Tuple[str, str, str]:
         """
-        Return (matched_key, path, match_type) where match_type is 'exact' | 'partial' | 'fallback'.
-        Mirrors get_voice_path() logic but tells you what actually matched.
+        Return (matched_key, path, match_type) where match_type ∈
+        {'exact', 'partial', 'fallback', 'none'}.
+
+        - 'exact': key exists exactly as provided
+        - 'partial': case-insensitive substring match (both directions)
+        - 'fallback': no match found, would fallback to the first available voice
+        - 'none': there are no voices at all
         """
+        if not self.voice_presets:
+            return "", "", "none"
+
         # exact
         if speaker_name in self.voice_presets:
             return speaker_name, self.voice_presets[speaker_name], "exact"
 
-        # partial (case-insensitive, substring both ways)
+        # partial (case-insensitive, substring either way)
         speaker_lower = speaker_name.lower()
         for preset_name, path in self.voice_presets.items():
             if preset_name.lower() in speaker_lower or speaker_lower in preset_name.lower():
                 return preset_name, path, "partial"
 
         # fallback
-        if not self.voice_presets:
-            return "", "", "fallback"
         default_key = next(iter(self.voice_presets))
         return default_key, self.voice_presets[default_key], "fallback"
 
     def get_voice_path(self, speaker_name: str) -> str:
-        """Get voice file path for a given speaker name"""
-        # First try exact match
-        if speaker_name in self.voice_presets:
-            return self.voice_presets[speaker_name]
-
-        # Try partial matching (case insensitive)
-        speaker_lower = speaker_name.lower()
-        for preset_name, path in self.voice_presets.items():
-            if preset_name.lower() in speaker_lower or speaker_lower in preset_name.lower():
-                return path
-
-        # Default to first voice if no match found
-        if not self.voice_presets:
+        """Get voice file path for a given speaker name (with fallback)."""
+        matched_key, path, match_type = self.best_match(speaker_name)
+        if match_type == "none":
             raise RuntimeError(
-                "No voice presets are available. Ensure the 'voices' directory exists and contains .wav files."
+                "No voice .wav files were found. Please add .wav files to the 'voices' directory."
             )
-        default_voice = list(self.voice_presets.values())[0]
-        print(
-            f"Warning: No voice preset found for '{speaker_name}', using default voice: {default_voice}"
-        )
-        return default_voice
+        if match_type == "fallback":
+            print(
+                f"Warning: No voice preset found for '{speaker_name}', using default voice: {path}"
+            )
+        return path
 
 
 def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
     """
-    Parse txt script content and extract speakers and their text
-    Fixed pattern: Speaker 1, Speaker 2, Speaker 3, Speaker 4
+    Parse txt script content and extract speakers and their text.
+    Expected format per line: 'Speaker X: text...'
     Returns: (scripts, speaker_numbers)
     """
     lines = txt_content.strip().split("\n")
-    scripts = []
-    speaker_numbers = []
+    scripts: List[str] = []
+    speaker_numbers: List[str] = []
 
-    # Pattern to match "Speaker X:" format where X is a number
     speaker_pattern = r"^Speaker\s+(\d+):\s*(.*)$"
 
     current_speaker = None
@@ -150,22 +141,21 @@ def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
 
         match = re.match(speaker_pattern, line, re.IGNORECASE)
         if match:
-            # If we have accumulated text from previous speaker, save it
+            # flush previous
             if current_speaker and current_text:
                 scripts.append(f"Speaker {current_speaker}: {current_text.strip()}")
                 speaker_numbers.append(current_speaker)
 
-            # Start new speaker
             current_speaker = match.group(1).strip()
             current_text = match.group(2).strip()
         else:
-            # Continue text for current speaker
+            # continuation
             if current_text:
                 current_text += " " + line
             else:
                 current_text = line
 
-    # Don't forget the last speaker
+    # flush last
     if current_speaker and current_text:
         scripts.append(f"Speaker {current_speaker}: {current_text.strip()}")
         speaker_numbers.append(current_speaker)
@@ -184,23 +174,29 @@ def print_available_voices(vm: VoiceMapper):
 def check_speaker_names(vm: VoiceMapper, speaker_names: List[str]) -> int:
     """
     Validate the given names. Returns 0 if all are 'exact' or 'partial',
-    otherwise prints details and returns 1.
+    otherwise prints details and returns 1. If no voices exist, returns 2.
     """
+    if not vm.list_speakers():
+        print("No voice .wav files were found in the 'voices' directory.")
+        print("Please add at least one .wav file and try again.")
+        return 2
+
     print("\nChecking requested speaker names...\n")
     exit_code = 0
+    all_known = vm.list_speakers()
+
     for name in speaker_names:
         matched_key, path, match_type = vm.best_match(name)
         if match_type == "fallback":
             exit_code = 1
-            suggestions = difflib.get_close_matches(
-                name, vm.list_speakers(), n=5, cutoff=0.5
-            )
-            msg = f"[MISSING] '{name}' → no match"
-            if matched_key:
-                msg += f" (would fallback to '{matched_key}')"
-            print(msg + ".")
+            suggestions = difflib.get_close_matches(name, all_known, n=5, cutoff=0.5)
+            print(f"[MISSING] '{name}' → no match (would fallback to '{matched_key}').")
             if suggestions:
                 print(f"          Did you mean: {', '.join(suggestions)}")
+        elif match_type == "none":
+            # handled above, but keep for completeness
+            exit_code = 2
+            print(f"[ERROR] No voices are available to match '{name}'.")
         else:
             label = "OK (exact)" if match_type == "exact" else f"OK (partial → '{matched_key}')"
             print(f"[{label}] '{name}' → {os.path.basename(path)}")
@@ -216,7 +212,6 @@ def parse_args():
         default="microsoft/VibeVoice-1.5b",
         help="Path to the HuggingFace model directory",
     )
-
     parser.add_argument(
         "--txt_path",
         type=str,
@@ -248,6 +243,7 @@ def parse_args():
         default=2,
         help="CFG (Classifier-Free Guidance) scale for generation (default: 2)",
     )
+    # NEW: voice inspection utilities
     parser.add_argument(
         "--list_voices",
         action="store_true",
@@ -256,7 +252,7 @@ def parse_args():
     parser.add_argument(
         "--check_speaker_names",
         action="store_true",
-        help="Validate provided --speaker_names against available voices and exit with non-zero if any are unavailable",
+        help="Validate provided --speaker_names and exit with non-zero if any are unavailable",
     )
 
     return parser.parse_args()
@@ -268,21 +264,21 @@ def main():
     # Initialize voice mapper
     voice_mapper = VoiceMapper()
 
-    # Handle utility flags early and exit
+    # Utility modes (exit early)
     if args.list_voices:
         print_available_voices(voice_mapper)
-        sys.exit(0)
+        return
 
     if args.check_speaker_names:
         speaker_names_list = (
-            args.speaker_names
-            if isinstance(args.speaker_names, list)
-            else [args.speaker_names]
+            args.speaker_names if isinstance(args.speaker_names, list) else [args.speaker_names]
         )
         rc = check_speaker_names(voice_mapper, speaker_names_list)
         if rc != 0:
-            print("One or more speaker names were not found. See suggestions above.")
-        sys.exit(rc)
+            print("One or more speaker names were not found or no voices exist. See details above.")
+        return
+
+    # Normal generation flow below
 
     # Check if txt file exists
     if not os.path.exists(args.txt_path):
@@ -308,20 +304,18 @@ def main():
 
     # Map speaker numbers to provided speaker names
     speaker_name_mapping: Dict[str, str] = {}
-    speaker_names_list = (
-        args.speaker_names if isinstance(args.speaker_names, list) else [args.speaker_names]
-    )
+    speaker_names_list = args.speaker_names if isinstance(args.speaker_names, list) else [args.speaker_names]
     for i, name in enumerate(speaker_names_list, 1):
         speaker_name_mapping[str(i)] = name
 
     print(f"\nSpeaker mapping:")
-    for speaker_num in set(speaker_numbers):
+    for speaker_num in sorted(set(speaker_numbers), key=int):
         mapped_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
         print(f"  Speaker {speaker_num} -> {mapped_name}")
 
     # Map speakers to voice files using the provided speaker names
-    voice_samples = []
-    actual_speakers = []
+    voice_samples: List[str] = []
+    actual_speakers: List[str] = []
 
     # Get unique speaker numbers in order of first appearance
     unique_speaker_numbers: List[str] = []
@@ -331,21 +325,16 @@ def main():
             unique_speaker_numbers.append(speaker_num)
             seen.add(speaker_num)
 
-    for speaker_num in unique_speaker_numbers:
-        speaker_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
-        matched_key, voice_path, match_type = voice_mapper.best_match(speaker_name)
-        if match_type == "fallback":
-            print(
-                f"Warning: No matching voice for '{speaker_name}'. Falling back to '{matched_key}'."
-            )
-        else:
-            if match_type == "partial" and matched_key != speaker_name:
-                print(f"Info: '{speaker_name}' matched preset '{matched_key}'.")
-        voice_samples.append(voice_path)
-        actual_speakers.append(speaker_name)
-        print(
-            f"Speaker {speaker_num} ('{speaker_name}') -> Voice: {os.path.basename(voice_path)}"
-        )
+    try:
+        for speaker_num in unique_speaker_numbers:
+            speaker_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
+            voice_path = voice_mapper.get_voice_path(speaker_name)
+            voice_samples.append(voice_path)
+            actual_speakers.append(speaker_name)
+            print(f"Speaker {speaker_num} ('{speaker_name}') -> Voice: {os.path.basename(voice_path)}")
+    except RuntimeError as e:
+        print(f"[ERROR] {e}")
+        return
 
     # Prepare data for model
     full_script = "\n".join(scripts)
@@ -357,6 +346,7 @@ def main():
 
     # Load model
     try:
+        # Keep using CUDA map here as in original code; adjust if needed based on args.device
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             args.model_path,
             torch_dtype=torch.bfloat16,
@@ -367,7 +357,8 @@ def main():
         print(f"[ERROR] : {type(e).__name__}: {e}")
         print(traceback.format_exc())
         print(
-            "Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality."
+            "Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully "
+            "tested, and using SDPA may result in lower audio quality."
         )
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             args.model_path,
@@ -380,9 +371,7 @@ def main():
     model.set_ddpm_inference_steps(num_steps=10)
 
     if hasattr(model.model, "language_model"):
-        print(
-            f"Language model attention: {model.model.language_model.config._attn_implementation}"
-        )
+        print(f"Language model attention: {model.model.language_model.config._attn_implementation}")
 
     # Prepare inputs for the model
     inputs = processor(
@@ -401,7 +390,6 @@ def main():
         max_new_tokens=None,
         cfg_scale=args.cfg_scale,
         tokenizer=processor.tokenizer,
-        # generation_config={'do_sample': False, 'temperature': 0.95, 'top_p': 0.95, 'top_k': 0},
         generation_config={"do_sample": False},
         verbose=True,
     )
@@ -409,9 +397,10 @@ def main():
     print(f"Generation time: {generation_time:.2f} seconds")
 
     # Calculate audio duration and additional metrics
-    if getattr(outputs, "speech_outputs", None) and outputs.speech_outputs[0] is not None:
-        # Assuming 24kHz sample rate (common for speech synthesis)
-        sample_rate = 24000
+    audio_duration = 0.0
+    rtf = float("inf")
+    if hasattr(outputs, "speech_outputs") and outputs.speech_outputs and outputs.speech_outputs[0] is not None:
+        sample_rate = 24000  # Assuming 24kHz sample rate
         audio_samples = (
             outputs.speech_outputs[0].shape[-1]
             if len(outputs.speech_outputs[0].shape) > 0
@@ -424,8 +413,6 @@ def main():
         print(f"RTF (Real Time Factor): {rtf:.2f}x")
     else:
         print("No audio output generated")
-        audio_duration = 0.0
-        rtf = float("inf")
 
     # Calculate token metrics
     input_tokens = inputs["input_ids"].shape[1]  # Number of input tokens
