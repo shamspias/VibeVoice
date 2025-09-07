@@ -173,8 +173,8 @@ def parse_args():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.3,
-        help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
+        default=2,
+        help="CFG (Classifier-Free Guidance) scale for generation (default: 2)",
     )
     
     return parser.parse_args()
